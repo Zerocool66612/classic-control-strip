@@ -1,0 +1,12 @@
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.so
+*.deb
+*.zip
+*.user
+main-v*-backup.cpp
+main-before-fix.cpp
