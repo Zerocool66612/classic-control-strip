@@ -1,4 +1,8 @@
 #include <QApplication>
+#include <cmath>
+#include <QLockFile>
+#include <QThread>
+#include <QCoreApplication>
 #include <QWidget>
 #include <QPainter>
 #include <QMouseEvent>
@@ -52,6 +56,7 @@
 #include <QColorDialog>
 #include <QFileDialog>
 #include <QPushButton>
+#include <QToolButton>
 #include <QGridLayout>
 #include <QScrollArea>
 #include <QGroupBox>
@@ -65,14 +70,20 @@
 #include <QWizard>
 #include <QWizardPage>
 #include <QRadioButton>
+#include <QDirIterator>
+#include <algorithm>
+#include <QLineEdit>
+#include <QTabWidget>
+#include <QSet>
+#include <QIcon>
 
 namespace {
 constexpr int stripHeight = 34;
 constexpr int moduleWidth = 42;
 constexpr int moduleStep = 43;
-constexpr int moduleCount = 11;
+constexpr int moduleCount = 12;
 constexpr int stripWidth = 24 + moduleStep * moduleCount + 2;
-const QStringList moduleNames = {"Display", "Clock", "Folders", "Lock", "Appearance", "Sound", "Network", "Storage", "CD / DVD", "Memory", "AppleTalk"};
+const QStringList moduleNames = {"Display", "Clock", "Folders", "Lock", "Appearance", "Sound", "Network", "Storage", "CD / DVD", "Memory", "AppleTalk", "App Viewer"};
 QString readText(const QString &path) { QFile f(path); return f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()).trimmed() : QString(); }
 
 
@@ -166,6 +177,14 @@ void icon(QPainter &p, int type, int x, int y) {
         for (int i=4;i<22;i+=4) { p.drawLine(i,3,i,5); p.drawLine(i,18,i,21); }
         break;
     }
+    case 11: { // retro application grid
+        p.setPen(QColor(48,48,48));
+        for (int row=0; row<2; ++row) for (int col=0; col<2; ++col) {
+            p.setBrush(QColor((col ? 77 : 211), (row ? 153 : 199), (col ? 193 : 102)));
+            p.drawRect(2+col*11,2+row*11,9,9);
+        }
+        break;
+    }
     case 10: { // classic connected network nodes
         p.setPen(QPen(ink,2)); p.drawLine(12,5,5,16); p.drawLine(12,5,20,16);
         p.drawLine(5,16,20,16);
@@ -232,7 +251,7 @@ public:
         setAttribute(Qt::WA_TranslucentBackground);
         setMouseTracking(true);
         setFixedSize(stripWidth, stripHeightPx);
-        setToolTip("Classic Control Strip 2.0.1 — drag handle in any direction; right-click for position controls");
+        setToolTip("Classic Control Strip 2.0.3 — drag handle in any direction; right-click for position controls");
         QSettings settings("MacaqueOS", "ClassicControlStrip");
         theme = static_cast<Theme>(qBound(0, settings.value("appearanceTheme", 0).toInt(), 2));
         accent = QColor(settings.value("accentColor", "#333399").toString());
@@ -252,7 +271,7 @@ public:
             if (id >= 0 && id < moduleCount && !order.contains(id)) order.append(id);
         }
         for (int id=0; id<moduleCount; ++id) if (!order.contains(id)) order.append(id);
-        for (int id=0; id<moduleCount; ++id) visible[id] = settings.value(QString("module%1Visible").arg(id), id < 8).toBool();
+        for (int id=0; id<moduleCount; ++id) visible[id] = settings.value(QString("module%1Visible").arg(id), (id < 8 || id == 11)).toBool();
         stripHeightPx = qBound(28, settings.value("creatorHeight",34).toInt(), 56);
         moduleStepPx = qBound(43, settings.value("creatorSpacing",43).toInt(), 66);
         customSurface = QColor(settings.value("creatorSurface","").toString());
@@ -408,7 +427,7 @@ protected:
             if (x < 24) setToolTip("Control Strip handle — drag to move, right-click for preferences");
             else if (expanded && slot >= 0 && slot < active.size())
                 setToolTip(moduleNames.at(active.at(slot)) + " — click for controls");
-            else setToolTip("Classic Control Strip 2.0.1");
+            else setToolTip("Classic Control Strip 2.0.3");
             return;
         }
         if (!dragging) return;
@@ -457,7 +476,10 @@ protected:
         index = active.at(index);
         QMenu menu(this);
         menu.setStyleSheet(themeMenuStyle());
-        if (index==5) {
+        if (index==11) {
+            showAppQuickLauncher(e->globalPosition().toPoint());
+            return;
+        } else if (index==5) {
             menu.addAction("Sound Volume")->setEnabled(false);
             menu.addAction("Mute / Unmute", [] { toggleMute(); });
             menu.addAction("Sound Settings", [] { launch("systemsettings", {"kcm_pulseaudio"}); });
@@ -632,7 +654,8 @@ protected:
             menu.addAction("Controls coming in later versions")->setEnabled(false);
         }
         menu.addSeparator();
-        menu.addAction("Customize Control Strip…", [this] { showCustomizeMenu(QCursor::pos()); });
+        menu.addAction("Customize…", [this] { showCustomizeMenu(QCursor::pos()); });
+        addSessionActions(menu);
         menu.exec(e->globalPosition().toPoint());
     }
 private:
@@ -655,6 +678,215 @@ private:
         settings.setValue("moduleOrder", ids);
         for (int id=0; id<moduleCount; ++id) settings.setValue(QString("module%1Visible").arg(id), visible[id]);
     }
+    struct DesktopApp { QString id, name, category, exec, iconName, desktopFile; };
+
+    QVector<DesktopApp> installedApps() const {
+        QVector<DesktopApp> apps;
+        QSet<QString> seen;
+        QStringList dirs = QStandardPaths::standardLocations(QStandardPaths::ApplicationsLocation);
+        dirs << QDir::homePath()+"/.local/share/applications" << "/usr/share/applications" << "/usr/local/share/applications";
+        for (const QString &base : dirs) {
+            QDir dir(base);
+            if (!dir.exists()) continue;
+            QDirIterator it(base, {"*.desktop"}, QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext()) {
+                const QString file = it.next();
+                const QString id = QDir(base).relativeFilePath(file).replace('/','-');
+                if (seen.contains(id)) continue;
+                seen.insert(id);
+                QSettings entry(file,QSettings::IniFormat);
+                entry.beginGroup("Desktop Entry");
+                if (entry.value("Type").toString()!="Application" || entry.value("Hidden",false).toBool() || entry.value("NoDisplay",false).toBool()) continue;
+                const QString name=entry.value("Name").toString();
+                const QString exec=entry.value("Exec").toString();
+                const QString tryExec=entry.value("TryExec").toString();
+                if (name.isEmpty() || exec.isEmpty() || (!tryExec.isEmpty() && !hasCommand(tryExec))) continue;
+                const QString categories=entry.value("Categories").toString();
+                QString category="Other";
+                for (const QString &c : {"Game","Network","Graphics","AudioVideo","Office","Development","Settings","System","Utility","Education"})
+                    if (categories.contains(c,Qt::CaseInsensitive)) { category=c; break; }
+                apps.append({id,name,category,exec,entry.value("Icon").toString(),file});
+            }
+        }
+        std::sort(apps.begin(),apps.end(),[](const DesktopApp &a,const DesktopApp &b){return a.name.localeAwareCompare(b.name)<0;});
+        return apps;
+    }
+
+    void launchDesktopApp(const DesktopApp &app) {
+        // Expand only standard desktop-entry Exec placeholders; never invoke a shell.
+        QString command=app.exec;
+        command.replace("%%", "\x01");
+        command.replace(QRegularExpression("%[fFuUdDnNickvm]"), "");
+        command.replace("\x01", "%");
+        QStringList parts=QProcess::splitCommand(command);
+        if (parts.isEmpty()) return;
+        const QString program=parts.takeFirst();
+        if (!QProcess::startDetached(program,parts))
+            QMessageBox::warning(this,"App Viewer","Could not launch " + app.name);
+        else {
+            QSettings settings("MacaqueOS","ClassicControlStrip");
+            QStringList recent=settings.value("appViewerRecent").toStringList();
+            recent.removeAll(app.id); recent.prepend(app.id);
+            while (recent.size()>10) recent.removeLast();
+            settings.setValue("appViewerRecent",recent);
+        }
+    }
+
+    void showAppQuickLauncher(const QPoint &point) {
+        const auto apps=installedApps();
+        QMenu menu(this); menu.setStyleSheet(themeMenuStyle());
+        QSettings settings("MacaqueOS","ClassicControlStrip");
+        const QStringList favorites=settings.value("appViewerFavorites").toStringList();
+        const QStringList recent=settings.value("appViewerRecent").toStringList();
+        auto appendGroup=[&](const QString &title,const QStringList &ids) {
+            if (ids.isEmpty()) return;
+            menu.addSection(title);
+            for (const QString &id : ids) {
+                for (const auto &app : apps) if (app.id==id) {
+                    menu.addAction(QIcon::fromTheme(app.iconName),app.name,[this,app]{launchDesktopApp(app);});
+                    break;
+                }
+            }
+        };
+        appendGroup("Favorites",favorites);
+        appendGroup("Recently Opened",recent);
+        if (favorites.isEmpty() && recent.isEmpty()) menu.addAction("No favorites yet")->setEnabled(false);
+        menu.addSeparator();
+        menu.addAction("Open App Viewer…",[this]{QTimer::singleShot(0,this,[this]{showAppViewer();});});
+        menu.exec(point);
+    }
+
+    void showAppViewer() {
+        const QVector<DesktopApp> apps=installedApps();
+        QDialog dialog(this);
+        dialog.setWindowTitle("Application Viewer — Classic Control Strip");
+        dialog.resize(740,540);
+        // Follow the same saved theme, custom colors and accent as the Control Strip.
+        // Derive high-contrast foregrounds from each surface for light AND dark presets.
+        const bool darkTheme = theme == Theme::Dark;
+        const QColor base = customSurface.isValid() ? customSurface :
+            (darkTheme ? QColor("#363941") : theme == Theme::Light ? QColor("#efefef") : QColor("#cccccc"));
+        const QColor tile = customModuleSurface.isValid() ? customModuleSurface :
+            (darkTheme ? QColor("#424650") : theme == Theme::Light ? QColor("#f7f7f7") : QColor("#e5e5e5"));
+        const QColor border = customBorder.isValid() ? customBorder :
+            (darkTheme ? QColor("#777c87") : QColor("#777777"));
+        const auto foreground = [](const QColor &c) {
+            // WCAG relative luminance chooses legible black/white text.
+            auto linear=[](double v) { v/=255.0; return v<=0.04045 ? v/12.92 : std::pow((v+0.055)/1.055,2.4); };
+            double luminance=0.2126*linear(c.red())+0.7152*linear(c.green())+0.0722*linear(c.blue());
+            return luminance > 0.179 ? QStringLiteral("#171717") : QStringLiteral("#ffffff");
+        };
+        const QString baseInk = foreground(base);
+        const QString tileInk = foreground(tile);
+        const QColor field = base.lightness() < 128 ? QColor("#252932") : QColor("#ffffff");
+        const QString fieldInk = foreground(field);
+        const QColor panelColor = base.lightness() < 128 ? base.lighter(112) : base.lighter(108);
+        const QString panelInk = foreground(panelColor);
+        const QColor highlight = accent.isValid() ? accent : QColor("#333399");
+        const QString highlightInk = foreground(highlight);
+        const QColor hover = tile.lightness() < 128 ? tile.lighter(120) : tile.darker(106);
+        const QString style = QString(
+            "QDialog { background:%1; color:%2; }"
+            "QLabel { color:%2; background:transparent; }"
+            "QLineEdit, QComboBox { background:%3; color:%4; padding:4px; border:1px solid %5; selection-background-color:%6; selection-color:%7; }"
+            "QComboBox QAbstractItemView { background:%3; color:%4; selection-background-color:%6; selection-color:%7; }"
+            "QScrollArea { background:%8; border:2px inset %5; }"
+            "QWidget#appViewerPanel { background:%8; color:%9; }"
+            "QToolButton { color:%10; background:%11; border:2px outset %5; padding:5px; font-weight:500; }"
+            "QToolButton:hover { color:%10; background:%12; }"
+            "QToolButton:focus { background:%6; color:%7; border:2px inset %5; }"
+            "QPushButton { color:%10; background:%11; border:2px outset %5; padding:5px; }"
+            "QMenu { background:%1; color:%2; selection-background-color:%6; selection-color:%7; }"
+        ).arg(base.name(),baseInk,field.name(),fieldInk,border.name(),highlight.name(),
+              highlightInk,panelColor.name(),panelInk,tileInk,tile.name(),hover.name());
+        dialog.setStyleSheet(style);
+        auto *layout=new QVBoxLayout(&dialog);
+        auto *header=new QLabel("▦  Application Viewer",&dialog);
+        QFont font=header->font(); font.setBold(true); font.setPointSize(font.pointSize()+2); header->setFont(font);
+        layout->addWidget(header);
+        auto *tools=new QHBoxLayout();
+        auto *search=new QLineEdit(&dialog); search->setPlaceholderText("Find an application…");
+        auto *category=new QComboBox(&dialog);
+        category->addItems({"All Applications","Favorites","Recently Opened","Games","Internet","Graphics","Multimedia","Office","Development","Settings","System","Utilities","Other"});
+        tools->addWidget(search,1); tools->addWidget(category); layout->addLayout(tools);
+        auto *scroll=new QScrollArea(&dialog); scroll->setWidgetResizable(true);
+        auto *panel=new QWidget(scroll); panel->setObjectName("appViewerPanel"); auto *grid=new QGridLayout(panel);
+        grid->setAlignment(Qt::AlignTop|Qt::AlignLeft); grid->setSpacing(12);
+        scroll->setWidget(panel); layout->addWidget(scroll,1);
+        auto *status=new QLabel(&dialog); layout->addWidget(status);
+        auto rebuild=[this,&apps,grid,search,category,status,panel,&dialog]() {
+            while (QLayoutItem *item=grid->takeAt(0)) {
+                if (item->widget()) item->widget()->deleteLater();
+                delete item;
+            }
+            QSettings settings("MacaqueOS","ClassicControlStrip");
+            const QStringList favorites=settings.value("appViewerFavorites").toStringList();
+            const QStringList recent=settings.value("appViewerRecent").toStringList();
+            int count=0;
+            for (const DesktopApp &app : apps) {
+                if (!app.name.contains(search->text(),Qt::CaseInsensitive)) continue;
+                const QString filter=category->currentText();
+                if (filter=="Favorites" && !favorites.contains(app.id)) continue;
+                if (filter=="Recently Opened" && !recent.contains(app.id)) continue;
+                const QMap<QString,QString> categoryMap={{"Games","Game"},{"Internet","Network"},{"Multimedia","AudioVideo"},{"Utilities","Utility"}};
+                if (filter!="All Applications" && filter!="Favorites" && filter!="Recently Opened" && app.category!=categoryMap.value(filter,filter)) continue;
+                auto *button=new QToolButton(panel);
+                button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+                button->setMinimumSize(112,104); button->setMaximumWidth(140);
+                button->setIcon(QIcon::fromTheme(app.iconName)); button->setIconSize(QSize(48,48));
+                button->setText(app.name.left(24)); button->setToolTip(app.name+"\nDouble-click to launch; right-click to favorite");
+                // Text, background and selected colors come from the explicit App Viewer stylesheet.
+                // A single click selects; a second click on the same item launches.
+                connect(button,&QToolButton::clicked,&dialog,[this,app,button,&dialog] {
+                    const QString current=dialog.property("selectedAppId").toString();
+                    if (current==app.id) { launchDesktopApp(app); dialog.setProperty("selectedAppId",QString()); }
+                    else { dialog.setProperty("selectedAppId",app.id); button->setFocus(); }
+                });
+                button->setContextMenuPolicy(Qt::CustomContextMenu);
+                connect(button,&QPushButton::customContextMenuRequested,&dialog,[this,app,button,&dialog] (const QPoint &p) {
+                    QSettings s("MacaqueOS","ClassicControlStrip");
+                    QStringList fav=s.value("appViewerFavorites").toStringList();
+                    QMenu m;
+                    m.addAction(fav.contains(app.id)?"Remove from Favorites":"Add to Favorites",[app,&dialog] {
+                        QSettings s2("MacaqueOS","ClassicControlStrip");
+                        QStringList ids=s2.value("appViewerFavorites").toStringList();
+                        if (ids.contains(app.id)) ids.removeAll(app.id); else ids.append(app.id);
+                        s2.setValue("appViewerFavorites",ids);
+                        dialog.setProperty("refreshFavorites",true);
+                    });
+                    m.addAction("Launch",[this,app]{launchDesktopApp(app);});
+                    m.exec(button->mapToGlobal(p));
+                });
+                grid->addWidget(button,count/5,count%5); ++count;
+            }
+            status->setText(QString("%1 applications shown — click twice to launch; right-click for Favorites").arg(count));
+        };
+        connect(search,&QLineEdit::textChanged,&dialog,[rebuild](const QString &){rebuild();});
+        connect(category,&QComboBox::currentTextChanged,&dialog,[rebuild](const QString &){rebuild();});
+        auto *refresh=new QTimer(&dialog);
+        connect(refresh,&QTimer::timeout,&dialog,[&dialog,rebuild] {
+            if (dialog.property("refreshFavorites").toBool()) { dialog.setProperty("refreshFavorites",false); rebuild(); }
+        });
+        refresh->start(250);
+        rebuild();
+        dialog.exec();
+    }
+
+    void addSessionActions(QMenu &menu) {
+        menu.addSeparator();
+        menu.addAction("Restart Control Strip", this, [this] {
+            // Delay startup to let this instance release its single-instance lock.
+            const QString executable = QCoreApplication::applicationFilePath();
+            if (!QProcess::startDetached(executable, {"--restart-control-strip"})) {
+                QMessageBox::warning(this, "Restart Control Strip",
+                                     "Unable to start a replacement instance.");
+                return;
+            }
+            QCoreApplication::quit();
+        });
+        menu.addAction("Quit Control Strip", this, [] { QCoreApplication::quit(); });
+    }
+
     void showCustomizeMenu(const QPoint &point) {
         QMenu menu(this);
         menu.setStyleSheet(themeMenuStyle());
@@ -683,6 +915,11 @@ private:
             });
         }
         menu.addSeparator();
+        addThemeMenu(menu);
+        menu.addSeparator();
+        menu.addAction("Control Strip Preferences…", [this] {
+            QTimer::singleShot(0, this, [this] { showPreferences(); });
+        });
         menu.addAction("System Settings…", [this] {
             QTimer::singleShot(0,this,[this]{showSystemSettings();});
         });
@@ -707,9 +944,10 @@ private:
         menu.addSeparator();
         menu.addAction("Restore Default Modules", [this] {
             order.clear();
-            for (int id=0; id<moduleCount; ++id) { order.append(id); visible[id] = (id < 8); }
+            for (int id=0; id<moduleCount; ++id) { order.append(id); visible[id] = (id < 8 || id == 11); }
             saveModules(); updateSize();
         });
+        addSessionActions(menu);
         menu.exec(point);
     }
     int maximumOffset() const {
@@ -832,34 +1070,14 @@ private:
             savePosition();
         });
         menu.addSeparator();
-        addThemeMenu(menu);
-        menu.addAction("System Settings…", &menu, [this] {
-            QTimer::singleShot(0,this,[this]{showSystemSettings();});
-        });
-        menu.addAction("Restore Current Theme Defaults", &menu, [this] {
-            restoreSelectedThemeDefaults();
-        });
-        menu.addAction("Theme Creator…", &menu, [this] {
-            QTimer::singleShot(0,this,[this]{showThemeCreator();});
-        });
-        menu.addAction("Theme Manager & Gallery…", &menu, [this] {
-            QTimer::singleShot(0, this, [this] { showThemeManager(); });
-        });
-        menu.addAction("Choose Accent Color…", &menu, [this] { chooseAccentColor(); });
-        menu.addAction("Custom Module Icons…", &menu, [this] {
-            QTimer::singleShot(0, this, [this] { showCustomIconsMenu(QCursor::pos()); });
-        });
-        menu.addAction("Export Preferences…", &menu, [this] { exportPreferences(); });
-        menu.addAction("Import Preferences…", &menu, [this] { importPreferences(); });
-        menu.addSeparator();
-        menu.addAction("Control Strip Preferences…", &menu, [this] {
-            QTimer::singleShot(0, this, [this] { showPreferences(); });
+        menu.addAction("Customize…", &menu, [this] {
+            QTimer::singleShot(0, this, [this] { showCustomizeMenu(QCursor::pos()); });
         });
         menu.addAction("About Classic Control Strip…", &menu, [this] {
             QTimer::singleShot(0, this, [this] { showAbout(); });
         });
+        addSessionActions(menu);
         menu.addSeparator();
-        menu.addAction("Customize Modules…", &menu, [this] { QTimer::singleShot(0, this, [this] { showCustomizeMenu(QCursor::pos()); }); });
         auto *dockAction = menu.addAction("Attach to left screen edge (Mac OS 9)");
         dockAction->setCheckable(true);
         dockAction->setChecked(dockedToLeft);
@@ -1172,7 +1390,7 @@ private:
         dialog.setWindowTitle("Classic Control Strip — Settings");
         dialog.setMinimumWidth(450);
         auto *layout = new QVBoxLayout(&dialog);
-        auto *heading = new QLabel("<b>Classic Control Strip 2.0.1</b><br>"
+        auto *heading = new QLabel("<b>Classic Control Strip 2.0.3</b><br>"
                                    "MacaqueOS desktop integration",&dialog);
         layout->addWidget(heading);
         auto *form = new QFormLayout;
@@ -1237,7 +1455,7 @@ private:
     }
     void showFirstRunWizard() {
         QDialog dialog(this);
-        dialog.setWindowTitle("Welcome to Classic Control Strip 2.0.1");
+        dialog.setWindowTitle("Welcome to Classic Control Strip 2.0.3");
         dialog.setMinimumWidth(475);
         auto *layout = new QVBoxLayout(&dialog);
         auto *welcome = new QLabel("<h2>Welcome to Classic Control Strip</h2>"
@@ -1592,6 +1810,21 @@ private:
 int main(int argc,char **argv) {
     QApplication app(argc,argv);
     app.setApplicationName("Classic Control Strip");
+    // Prevent accidental duplicate panels, including when launching the
+    // system-installed package and a local build at the same time.
+    // Lock is scoped to this user, not to the executable's directory.
+    const QString lockName = QString::fromLatin1(
+        QCryptographicHash::hash(QDir::homePath().toUtf8(), QCryptographicHash::Sha256).toHex().left(16));
+    QLockFile instanceLock(QDir::tempPath() + "/classic-control-strip-" + lockName + ".lock");
+    instanceLock.setStaleLockTime(0);
+    if (app.arguments().contains("--restart-control-strip"))
+        QThread::msleep(750);
+    if (!instanceLock.tryLock(1000)) {
+        QMessageBox::information(nullptr, "Classic Control Strip",
+                                 "Classic Control Strip is already running.\n"
+                                 "Use its right-click menu to Quit or Restart it.");
+        return 0;
+    }
     app.setStyle(QStyleFactory::create("Fusion"));
     ControlStrip strip;
     strip.winId();
